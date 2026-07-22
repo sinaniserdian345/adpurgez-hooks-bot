@@ -1,3 +1,4 @@
+import "dotenv/config";
 import { Client, Events, GatewayIntentBits, Partials } from "discord.js";
 
 // ---- config (from environment / .env) ----
