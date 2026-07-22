@@ -19,19 +19,18 @@ if (!cfg.token || !cfg.key) {
 // Adpurgez limits: image/jpeg|png|webp, 5 MB decoded per screenshot. We send one image per
 // request (a single creative object) so we never brush the 7 MiB per-request cap.
 const MAX_DECODED = 5 * 1024 * 1024;
-const EXT_MIME = { jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png", webp: "image/webp" };
 
-function mimeOf(att) {
-  let m = (att.contentType || "").toLowerCase().split(";")[0].trim();
-  if (m === "image/jpg") m = "image/jpeg";
-  if (["image/jpeg", "image/png", "image/webp"].includes(m)) return m;
-  const ext = (att.name || "").toLowerCase().split(".").pop();
-  return EXT_MIME[ext] || null;
+// Detect the real image type from the file's magic bytes, so image_content_type always
+// matches what the server re-detects (it rejects on any mismatch).
+function sniffMime(buf) {
+  if (buf.length < 12) return null;
+  if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return "image/jpeg";
+  if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) return "image/png";
+  if (buf.toString("ascii", 0, 4) === "RIFF" && buf.toString("ascii", 8, 12) === "WEBP") return "image/webp";
+  return null;
 }
 
 async function ingest(att, msg) {
-  const mime = mimeOf(att);
-  if (!mime) return { s: "skip", why: "not a JPG / PNG / WebP image" };
   if (att.size > MAX_DECODED) return { s: "skip", why: "over 5 MB" };
 
   let buf;
@@ -43,6 +42,8 @@ async function ingest(att, msg) {
     return { s: "error", why: "download failed" };
   }
   if (buf.length > MAX_DECODED) return { s: "skip", why: "over 5 MB" };
+  const mime = sniffMime(buf);
+  if (!mime) return { s: "skip", why: "not a JPG / PNG / WebP image" };
 
   const payload = JSON.stringify({
     image_b64: buf.toString("base64"),
@@ -51,24 +52,29 @@ async function ingest(att, msg) {
     forwarded_at: new Date().toISOString(),
   });
 
-  let r, j;
+  let r, raw = "", j = null;
   try {
     r = await fetch(cfg.url, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${cfg.key}` },
       body: payload,
     });
-    j = await r.json().catch(() => ({}));
+    raw = await r.text();
+    try { j = JSON.parse(raw); } catch {}
   } catch {
     return { s: "error", why: "couldn't reach Adpurgez" };
   }
 
-  if (r.status === 429) return { s: "error", why: "hourly limit reached — try again later" };
-  if (r.status === 401) return { s: "error", why: "ingestion key rejected — check ADPURGEZ_INGEST_KEY" };
-  if (!r.ok) return { s: "error", why: (j && j.error) || `HTTP ${r.status}` };
-  if (j.status === "created") return { s: "created", id: j.id };
-  if (j.status === "duplicate") return { s: "duplicate", id: j.id };
-  return { s: "error", why: (j && j.error) || "rejected by Adpurgez" };
+  // Surface whatever the server actually said, in whatever shape it came back.
+  const serverMsg =
+    (j && (j.error || j.message || (Array.isArray(j.items) && j.items[0] && j.items[0].error))) ||
+    (raw ? raw.replace(/\s+/g, " ").trim().slice(0, 180) : "");
+
+  if (r.status === 429) return { s: "error", why: serverMsg || "hourly limit reached — try again later" };
+  if (r.status === 401) return { s: "error", why: serverMsg || "ingestion key rejected — check ADPURGEZ_INGEST_KEY" };
+  if (j && j.status === "created") return { s: "created", id: j.id };
+  if (j && j.status === "duplicate") return { s: "duplicate", id: j.id };
+  return { s: "error", why: serverMsg || `HTTP ${r.status}` };
 }
 
 const client = new Client({
